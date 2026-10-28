@@ -1,0 +1,196 @@
+# oros_daily.yml — OROS goes live: unattended daily run in the cloud.
+#
+# Runs scripts/oros_run.py on GitHub's servers every weekday, so the scan,
+# the auto-built portfolio, the scan-complete notification, and the daily
+# gains/losses PDF report all happen whether JP's Mac is on or not.
+#
+# Guardrails preserved: OROS proposes and journals only — it never trades.
+#
+# Required repository secrets (Settings -> Secrets and variables -> Actions):
+#   GMAIL_ADDRESS        the sending Gmail account
+#   GMAIL_APP_PASSWORD   a Google App Password (NOT the login password)
+#   OROS_REPORT_TO       JPR20@fordham.edu
+#   ANTHROPIC_API_KEY    optional (LLM narrative is off in unattended runs)
+#   FRED_API_KEY         optional (yield slope / credit spread context)
+#   ALPHA_VANTAGE_API_KEY, FMP_API_KEY   optional
+#
+# The journal (data/journal) is committed back to the repo after each run so
+# the forward paper-trade track record accrues across ephemeral runners.
+# KEEP THIS REPOSITORY PRIVATE.
+
+name: OROS daily run
+
+on:
+  schedule:
+    # Two runs per trading day. PRE-MARKET brief (JP, 2026-08-07): the
+    # morning note must be in the inbox BEFORE the 9:30 bell, like a real
+    # research desk — entries are computed on completed daily bars, and a
+    # report that lands mid-open is late by definition. GitHub's scheduler
+    # routinely fires cron 15-45 minutes late, so both slots aim early:
+    #   morning brief: 12:00 UTC = 8:00 ET (EDT) -> lands ~8:20-8:50 ET,
+    #                  before the open even on a slow queue day
+    #   close wrap:    20:50 UTC = 16:50 ET (EDT) -> lands ~17:15-17:45 ET
+    # In winter (EST) both fire an hour earlier; adjust each November if
+    # that matters.
+    - cron: "0 12 * * 1-5"
+    - cron: "50 20 * * 1-5"
+  workflow_dispatch: {}        # manual "Run workflow" button for testing
+
+permissions:
+  contents: write              # to commit the journal back
+
+concurrency:
+  group: oros-daily
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Free runner disk space
+        # 2026-09-04 incident: four straight days of "[Errno 28] No space left
+        # on device" in the install step. sentence-transformers 6.0.1 (released
+        # 2026-08-31, the night the run went dark) raised its torch floor, and
+        # torch's default PyPI wheels now drag in the whole CUDA 13 stack —
+        # ~7 GB of nvidia-* wheels a CPU-only runner never executes. Reclaim
+        # the runner's pre-baked toolchains before pip ever starts.
+        run: |
+          echo "disk before:"; df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/powershell \
+                      /usr/share/swift || true
+          echo "disk after:"; df -h / | tail -1
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+          python -m pip install --upgrade pip
+          # CPU-ONLY torch, installed first: satisfies sentence-transformers so
+          # the resolver never reaches for the CUDA wheel set. OROS embeds a
+          # handful of book chunks; it has never needed a GPU.
+          pip install --index-url https://download.pytorch.org/whl/cpu "torch>=2.2,<3"
+          # earthengine (satellite) is optional and slow; skip it in the cloud.
+          grep -v "earthengine-api" requirements.txt > /tmp/reqs.txt
+          pip install -r /tmp/reqs.txt
+          echo "disk after install:"; df -h / | tail -1
+
+      - name: Restore price cache
+        uses: actions/cache@v4
+        with:
+          path: data/cache
+          key: oros-price-cache-${{ github.run_id }}
+          restore-keys: |
+            oros-price-cache-
+
+      - name: Write .env from secrets
+        run: |
+          cat > .env <<EOF
+          GMAIL_ADDRESS=${{ secrets.GMAIL_ADDRESS }}
+          GMAIL_APP_PASSWORD=${{ secrets.GMAIL_APP_PASSWORD }}
+          OROS_REPORT_TO=${{ secrets.OROS_REPORT_TO }}
+          ANTHROPIC_API_KEY=${{ secrets.ANTHROPIC_API_KEY }}
+          ELEVENLABS_API_KEY=${{ secrets.ELEVENLABS_API_KEY }}
+          YT_CLIENT_ID=${{ secrets.YT_CLIENT_ID }}
+          YT_CLIENT_SECRET=${{ secrets.YT_CLIENT_SECRET }}
+          YT_REFRESH_TOKEN=${{ secrets.YT_REFRESH_TOKEN }}
+          FRED_API_KEY=${{ secrets.FRED_API_KEY }}
+          ALPHA_VANTAGE_API_KEY=${{ secrets.ALPHA_VANTAGE_API_KEY }}
+          FMP_API_KEY=${{ secrets.FMP_API_KEY }}
+          OROS_DIGEST_TO=${{ vars.OROS_DIGEST_TO || '' }}
+          OROS_REPORT_URL_BASE=${{ vars.OROS_REPORT_URL_BASE }}
+          EOF
+
+      - name: OROS run (scan + auto portfolio + report email)
+        run: |
+          # scan cap comes from ml/oros_config.py — never restated here
+          OROS_RUN_SOURCE=cloud PYTHONPATH=. python scripts/oros_run.py --mandate auto
+
+      - name: Alert on failure (email)
+        # failure() alone misses timeout kills (GitHub marks those "cancelled");
+        # both must alert — silence may never look like a quiet day.
+        if: ${{ failure() || cancelled() }}
+        env:
+          GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          OROS_REPORT_TO: ${{ secrets.OROS_REPORT_TO }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 - <<'EOF'
+          import os, smtplib
+          from email.message import EmailMessage
+          user = os.environ.get("GMAIL_ADDRESS", "")
+          pw = os.environ.get("GMAIL_APP_PASSWORD", "")
+          to = os.environ.get("OROS_REPORT_TO", "") or user
+          if not (user and pw and to):
+              raise SystemExit("alert email unconfigured")
+          msg = EmailMessage()
+          msg["Subject"] = "OROS ALERT: daily run FAILED"
+          msg["From"], msg["To"] = user, to
+          msg.set_content(
+              "The OROS cloud run FAILED before completing. No scan "
+              "confirmation or daily report was produced today.\n\n"
+              "Full log: " + os.environ.get("RUN_URL", "(unknown)") + "\n\n"
+              "Without this alert, the failure would have been silent - "
+              "a missing email that looks like a quiet day.")
+          with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as s:
+              s.login(user, pw)
+              s.send_message(msg)
+          print("failure alert sent to", to)
+          EOF
+
+      - name: Upload report PDF as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oros-report-${{ github.run_number }}
+          path: data/journal/reports/*.pdf
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Commit journal back (forward track record)
+        if: always()
+        run: |
+          git config user.name "oros-bot"
+          git config user.email "actions@github.com"
+          git add data/journal || true
+          git diff --cached --quiet || git commit -m "OROS daily run: journal $(date -u +%F)"
+          git pull --rebase origin ${GITHUB_REF_NAME} || true
+          git push || echo "journal push failed (non-fatal)"
+
+      # Public PDF mirror (JP, 2026-07-18): pushes the day's report to the
+      # public oros-reports repo so the YouTube description can link it.
+      # Activates only when the OROS_REPORTS_TOKEN secret exists (a
+      # fine-grained PAT with contents:write on jpromer3006/oros-reports).
+      - name: Mirror report PDF to public repo
+        if: always() && env.REPORTS_TOKEN != ''
+        env:
+          REPORTS_TOKEN: ${{ secrets.OROS_REPORTS_TOKEN }}
+        run: |
+          # HARD GATE (2026-08-06 security review): never mirror a PDF built
+          # with the personal book, and refuse any PDF whose text contains
+          # personal-account markers. The public repo is public forever.
+          if [ "${OROS_PERSONAL_BOOK:-0}" = "1" ]; then
+            echo "personal book enabled — refusing to mirror"; exit 0
+          fi
+          PDF="data/journal/reports/oros_report_$(date -u +%F).pdf"
+          if [ -f "$PDF" ]; then
+            # fail-closed: any parse error also refuses the mirror
+            if python -c "from pypdf import PdfReader; import sys; t=' '.join((p.extract_text() or '') for p in PdfReader('$PDF').pages); sys.exit(1 if ('your real holdings' in t or '8661' in t) else 0)"; then :; else
+              echo 'PII marker (or parse failure) — refusing to mirror'; exit 0
+            fi
+            git clone --depth 1 "https://x-access-token:${REPORTS_TOKEN}@github.com/jpromer3006/oros-reports.git" /tmp/reports
+            cp "$PDF" /tmp/reports/
+            cd /tmp/reports
+            git config user.name "oros-bot"; git config user.email "actions@github.com"
+            git add . && git commit -m "report $(date -u +%F)" && git push || echo "mirror push failed (non-fatal)"
+          fi

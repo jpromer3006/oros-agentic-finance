@@ -1,0 +1,14 @@
+.env
+.env.local
+*.key
+*client_secret*.json
+*gee_service_account*.json
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+data/
+.streamlit/secrets.toml
+.DS_Store
+.vscode/
+*.log
